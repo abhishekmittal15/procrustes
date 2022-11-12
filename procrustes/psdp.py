@@ -37,15 +37,157 @@ __all__ = [
     "psdp_opt",
     "psdp_projgrad",
     "psdp_fgm",
+    "psdp_partan",
+    "psdp_anfgm",
 ]
 
 
-def psdp_fgm(
+def psdp_anfgm(
+    a: np.ndarray,
+    b: np.ndarray,
+    max_iterations: int = 10000,
+    x_tol: float = 1e-6,
+    f_tol: float = 1e-6,
+    pad: bool = True,
+    translate: bool = False,
+    scale: bool = False,
+    unpad_col: bool = False,
+    unpad_row: bool = False,
+    check_finite: bool = True,
+    weight: Optional[np.ndarray] = None,
+) -> ProcrustesResult:
+    r"""
+    We want to minimize the function ||SAT-B||_F where A and B are n*m matrices and S is n*n transformation we want to find that minimizes the above function and T is just an identity matrix for now. We are only considering left transformation.
+
+    The paper minimizes the following function ||AX-B||_F, so the mapping between the problem statements are
+    Term used in paper             Term used in our implementation
+    --------------------------------------------------------------
+    A                               S
+    X                               A
+    B                               B
+    """
+    A, B = setup_input_arrays(
+        a,
+        b,
+        unpad_col,
+        unpad_row,
+        pad,
+        translate,
+        scale,
+        check_finite,
+        weight,
+    )
+    
+    if A.shape != B.shape:
+        raise ValueError(
+            f"Shape of A and B does not match: {a.shape} != {b.shape} "
+            "Check pad, unpad_col, and unpad_row arguments."
+        )
+
+    n, m = A.shape
+
+    r = np.linalg.matrix_rank(A)
+    U, S, VH = np.linalg.svd(A, full_matrices=True)
+    V = VH.conj().T
+
+    # Sanity checks for the shapes of the matrices above
+    print(U.shape)
+    print(S.shape)
+    print(V.shape)
+    assert(U.shape == (n, n))
+    # assert(S.shape == (n, m))
+    assert(V.shape == (m, m))
+
+    D1 = np.diag(S)
+    U1 = U[:, :r]
+    U2 = U[:, r:n]
+    V1 = V[:, :r]
+    V2 = V[:, r:m]
+
+    # Eigen Decomposition of U1'*(B*A'+A*B')*U1 to see if its a negative definite matrix or not
+    X = U1.conj().T@(B@A.conj().T+A@B.conj().T)@U1
+    eig, _ = np.linalg.eig(X)
+
+    # Pre Computations
+    mat1 = U1.conj().T@B@V1
+    mat2 = U2.conj().T@B@V1
+
+    if all(eig<0):
+        mat3 = B@V2
+        es = np.sqrt((np.linalg.norm(mat1,'fro'))**2 + (np.linalg.norm(mat3,'fro'))^2)
+        alpha = 4*np.sqrt(n)*np.linalg.norm(D1,'fro')*np.linalg.norm(mat1,'fro'); 
+        tol = 1e-6; # Precision of the solution as the infimum is not attained
+        if tol/alpha < 1e-9: # This avoids numerical problems 
+            tol = 1e-9*alpha; 
+        S11=np.zeros((r, 1))
+        for j in range(r):
+            S11[j,j]=tol/alpha
+        K = (mat2@np.linalg.inv(D1))@np.linalg.inv(S11)@(mat2@np.linalg.inv(D1)).conj().T
+        t = U1@S11@U1.conj().T
+        Shat = t + U2@(mat2@np.linalg.inv(D1))@U1.conj().T + U1@(mat2@np.linalg.inv(D1)).conj().T@U2.conj().T+U2@K@U2.conj().T
+        ubound=np.linalg.norm(Shat@A-B,'fro'); 
+        status = 'inf(||AX-B||_F) is not attained for any PSD A because U1''*(B*X''+X*B'')*U1 < 0 (Theorem 3.2)';
+    else:
+        Bprime = mat1
+        # Use recursive initialization
+        S0rec = _rec_init_projgrad(D1, Bprime, 100)
+        # Use FGM to solve the subproblem 
+        S11 = psdp_fgm(D1, Bprime,max_iterations=max_iterations,S0= S0rec)["s"]
+        # es = sqrt(es.^2 + (norm(B*V2,'fro'))^2);
+        
+        # Theorem 3.1: depending on A11, we can conclude whether the infimum is
+        # attained and compute a optimal solution accordingly. 
+        # ***CASE 1*** infimum attained if and only if 
+        # A11 positive definite
+        # OR 
+        # Ker(A11) in ker(U2'*B*V1*inv(D1)) 
+        S11_eig, _ = np.linalg.eig(S11)
+        if all(S11_eig>10^-9) or np.linalg.norm(mat2@np.linalg.inv(D1) * scipy.linalg.null(S11) ,'fro') < 1e-6:
+            K=(mat2@np.linalg.inv(D1))@np.linalg.pinv(S11)@(mat2@np.linalg.inv(D1)).conj().T
+            Shat=U1@S11@U1.conj().T + U2@(mat2@np.linalg.inv(D1))@U1.conj().T + U1@(mat2@np.linalg.inv(D1)).conj().T@U2.conj().T+U2@K@U2.conj().T
+            ubound = np.linalg.norm(Shat@A-B,'fro')
+            status = 'inf(||AX-B||_F) is attained by Ahat';       
+        # ***CASE 2*** infimim not attained 
+        else:
+            S11 = (S11+S11.conj().T)/2
+            D11, U11 = np.linalg.eig(S11)
+            d = np.diag(D11)
+            s = len(d[d<10^-12])
+            beta = 4*np.sqrt(r-s)*np.linalg.norm(D1,'fro')*np.linalg.norm(S11@D1-mat1,'fro') 
+            tol = 1e-6  # Precision of the solution if the infimum is not attained
+            if tol/beta < 1e-9: # This avoids numerical problems 
+                tol = 1e-9*beta
+            Temp = D11
+            for j in range(s):
+                Temp[j,j] = tol/beta
+            Temp = U11@Temp@U11.conj().T    
+            K = (mat2@np.linalg.inv(D1))@np.linalg.inv(Temp)@(mat2*np.linalg.inv(D1)).conj().T
+            Shat = U1@Temp@U1.conj().T + U2@(mat2@np.linalg.inv(D1))@U1.conj().T + U1@(mat2@np.linalg.inv(D1)).conj().T@U2.conj().T+U2@K@U2.conj().T
+            ubound = np.linalg.norm(Shat@A-B,'fro')
+            status = "inf(||AX-B||_F) is not attained for any PSD A because S11 not > 0 and Ker(S11) not in ker(U2''*B*V1*inv(D1))"
+        
+        # For highly ill-conditioned problems, it may happen that the analytical
+        # approach does not lead to an acceptable solution, because of numerical
+        # instability. This can be detected by comparing es (semi-analytical
+        # error) with the actual final error of Ahat (ubound). 
+        # if abs( ubound - es(end) ) / ( norm(B,'fro')+1e-6 ) > 0.01 % Relative error > 1% 
+        #     warning('The problem is highly ill-conditioned and the analytical error does not coincide with the computed solution.'); 
+        # end
+        # ts = ts + cputime - tmimec - ts(end);  
+    return ProcrustesResult(
+        new_a=A,
+        new_b=B,
+        error=compute_error(a=a, b=b, t=np.eye(m), s=Shat),
+        t=np.eye(m),
+        s=Shat,
+    )
+
+def psdp_partan(
     a: np.ndarray,
     b: np.ndarray,
     max_iterations: int = 1000,
-    delta: float = 1e-6,
-    tol: float = 1e-6,
+    x_tol: float = 1e-6,
+    f_tol: float = 1e-6,
     pad: bool = True,
     translate: bool = False,
     scale: bool = False,
@@ -85,6 +227,107 @@ def psdp_fgm(
     n, m = A.shape
 
     S = _init_procustes_projgrad(A, B)
+    Sp = S
+
+    # Performing some precomputations
+    AAT = A@A.conj().T
+    x, _ = np.linalg.eig(AAT)
+    max_eig = np.max(x) ** 2 # Not sure if these can be complex too, if they are complex, then need to take norm
+    min_eig = np.min(x) ** 2 # Same as above
+    BAT = B@A.conj().T
+
+    # Initialization of the algorithm
+    alpha = 0
+    i = 1
+    eps  = 1
+    eps0 = 0
+    err = np.zeros((max_iterations + 1, 1))
+
+    while i <= max_iterations and eps >= x_tol*eps0:   
+
+        err[i] = np.linalg.norm(S@A-B, 'fro')
+        if err[i] < f_tol:
+            break
+
+        Spp = Sp
+        Sp  = S
+        # Projected gradient step
+        GS = S@AAT - BAT
+        Z = _psd_proj(S - GS/max_eig)
+        if i % n == 0:
+            alpha = 1
+        else:
+            mat1 = Spp@A - B
+            mat2 = (Z-Spp)@A
+            print(i, mat2)
+            alpha =  - np.sum(mat1 * mat2)/np.linalg.norm(mat2, 'fro')**2
+            alpha = 1 if alpha < 0 else alpha
+            alpha = 1 if np.linalg.norm(S@A-B, 'fro') > np.linalg.norm(Z@A-B, 'fro') else alpha
+        # Linear combination of the previous and the current iterates
+        S = Spp + alpha*(Z - Spp)
+        if i ==1:
+            eps0 = np.linalg.norm(S-Sp, 'fro')
+        eps = np.linalg.norm(S-Sp, 'fro')
+        i += 1
+
+    return ProcrustesResult(
+        new_a=A,
+        new_b=B,
+        error=compute_error(a=a, b=b, t=np.eye(m), s=S),
+        t=np.eye(m),
+        s=S,
+    )
+
+
+def psdp_fgm(
+    a: np.ndarray,
+    b: np.ndarray,
+    max_iterations: int = 1000,
+    delta: float = 1e-6,
+    tol: float = 1e-6,
+    S0: np.ndarray = None,
+    pad: bool = True,
+    translate: bool = False,
+    scale: bool = False,
+    unpad_col: bool = False,
+    unpad_row: bool = False,
+    check_finite: bool = True,
+    weight: Optional[np.ndarray] = None,
+) -> ProcrustesResult:
+    r"""
+    We want to minimize the function ||SAT-B||_F where A and B are n*m matrices and S is n*n transformation we want to find that minimizes the above function and T is just an identity matrix for now. We are only considering left transformation.
+
+    The paper minimizes the following function ||AX-B||_F, so the mapping between the problem statements are
+    Term used in paper             Term used in our implementation
+    --------------------------------------------------------------
+    A                               S
+    X                               A
+    B                               B
+    """
+    A, B = setup_input_arrays(
+        a,
+        b,
+        unpad_col,
+        unpad_row,
+        pad,
+        translate,
+        scale,
+        check_finite,
+        weight,
+    )
+    
+    if A.shape != B.shape:
+        raise ValueError(
+            f"Shape of A and B does not match: {a.shape} != {b.shape} "
+            "Check pad, unpad_col, and unpad_row arguments."
+        )
+
+    n, m = A.shape
+
+    if isinstance(S0, np.ndarray):
+        S = S0
+    else:
+        S = _init_procustes_projgrad(A, B)
     
     # Performing some precomputations
     AAT = A@A.conj().T
@@ -145,6 +388,8 @@ def psdp_projgrad(
     weight: Optional[np.ndarray] = None,
 ) -> ProcrustesResult:
     r"""
+    Projected gradient method for the positive semi-definite Procrustes problem.
+
     We want to minimize the function ||SAT-B||_F where A and B are n*m matrices and S is n*n transformation we want to find that minimizes the above function and T is just an identity matrix for now. We are only considering left transformation.
 
     The paper minimizes the following function ||AX-B||_F, so the mapping between the problem statements are
@@ -1017,3 +1262,62 @@ def _init_procustes_projgrad(
         return S1
     elif e2 < e1 or choice == 2:
         return S2
+
+
+def _rec_init_projgrad(
+    A: np.ndarray,
+    B: np.ndarray,
+    paramcond: float = 1e-1
+) -> np.ndarray:
+    r"""
+    Returns the starting point of the transformation S of the analytical FGM method
+    """
+    n, m = A.shape 
+
+    # We want the A matrix to be a diagonal matrix
+    if m != n or np.linalg.norm(np.diag(np.diag(A)) - A) > 1e-6:
+        raise ValueError("The A matrix has to be a diagonal matrix in the recursive initialization")
+    
+    Adiag = np.diag(A)
+    Adiags, perm = np.sort(Adiag), np.argsort(Adiag)
+    perminv = np.sort(perm)
+    Aperm = A[perm][:, perm] # Swapping the rows first and then the columns
+    Bperm = B[perm][:, perm] # Swapping the rows and columns of the B matrix also
+
+    # If A is ill-conditioned, then we need to partition A
+    if Adiags[n - 1] / Adiags[0] > paramcond:
+        k = _find_partition(Adiags)
+        k1 = range(k)
+        k2 = range(k, n)
+        S01 = _rec_init_projgrad(Aperm[k1, k1], Bperm[k1, k1], paramcond)
+        S02 = _rec_init_projgrad(Aperm[k2, k2], Bperm[k2, k2], paramcond)
+        S0_left  = np.hstack((S01, np.zeros((n - k, k))))
+        S0_right = np.hstack((np.zeros((k, n - k)), S02))
+        S0 = np.vstack((S0_left, S0_right))
+    else:
+        S0 = psdp_fgm(Aperm, Bperm, max_iterations=100)["s"]
+    S0 = S0[perminv]
+    return S0
+
+def _find_partition(
+    x: np.ndarray
+) -> np.ndarray:
+    r"""
+    Returns the optimal position where we should partition the array into blocks for the recursive initialization algorithm used in the Fast Gradient Method
+    """
+    n = x.shape[0]
+    partition = -1
+    cond_nums = []
+    for k in range(n):
+        if k == 1:
+            cond_nums.append(x[n - 1] / x[1])
+        elif k == n - 1:
+            cond_nums.append(x[n - 2] / x[0])
+        else:
+            cond_nums.append(max(x[k] / x[1], x[n - 1] / x[k + 1]))
+    
+    partition = np.argmin(cond_nums)
+
+
+
+
