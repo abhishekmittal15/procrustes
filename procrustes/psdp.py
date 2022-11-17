@@ -376,9 +376,7 @@ def psdp_fgm(
 def psdp_projgrad(
     a: np.ndarray,
     b: np.ndarray,
-    max_iterations: int = 1000,
-    delta: float = 1e-6,
-    tol: float = 1e-6,
+    options: Dict = {},
     pad: bool = True,
     translate: bool = False,
     scale: bool = False,
@@ -398,6 +396,72 @@ def psdp_projgrad(
     A                               S
     X                               A
     B                               B
+
+    Parameters
+    ----------
+    a : np.ndarray
+        The matrix :math:`\mathbf{A}` which is to be transformed.
+
+    b : np.ndarray
+        The target matrix :math:`\mathbf{B}`.
+
+    options : Dict, optional
+        Dictionary with fields that serve as parameters for the algorithm.
+
+        max_iter : int
+            Maximum number of iterations.
+            Default value is 10000.
+
+        x_tol : float
+            Stop control for ||X_k - X_{k-1}||_F.
+            Defaut value is 1e-5.
+
+        f_tol : float
+            Stop control for |F_k - F_{k-1}|/(1+|F_{k-1}|).
+            Default value is 1e-12.
+
+    pad : bool, optional
+        Add zero rows (at the bottom) and/or columns (to the right-hand side) of matrices
+        :math:`\mathbf{A}` and :math:`\mathbf{B}` so that they have the same shape.
+
+    translate : bool, optional
+        If True, both arrays are centered at origin (columns of the arrays will have mean zero).
+
+    scale : bool, optional
+        If True, both arrays are normalized with respect to the Frobenius norm, i.e.,
+        :math:`\text{Tr}\left[\mathbf{A}^\dagger\mathbf{A}\right] = 1` and
+        :math:`\text{Tr}\left[\mathbf{B}^\dagger\mathbf{B}\right] = 1`.
+
+    unpad_col : bool, optional
+        If True, zero columns (with values less than 1.0e-8) on the right-hand side of the intial
+        :math:`\mathbf{A}` and :math:`\mathbf{B}` matrices are removed.
+
+    unpad_row : bool, optional
+        If True, zero rows (with values less than 1.0e-8) at the bottom of the intial
+        :math:`\mathbf{A}` and :math:`\mathbf{B}` matrices are removed.
+
+    check_finite : bool, optional
+        If True, convert the input to an array, checking for NaNs or Infs.
+
+    weight : ndarray, optional
+        The 1D-array representing the weights of each row of :math:`\mathbf{A}`. This defines the
+        elements of the diagonal matrix :math:`\mathbf{W}` that is multiplied by :math:`\mathbf{A}`
+        matrix, i.e., :math:`\mathbf{A} \rightarrow \mathbf{WA}`.
+
+    Returns
+    -------
+    ProcrustesResult
+        The result of the Procrustes transformation.
+
+    Notes
+    -----
+    The Projected Gradient algorithm (on which this implementation is based) is defined well in p. 131
+    of [1]_.
+
+    References
+    ----------
+    .. [1] Nicolas Gillis, Punit Sharma, "A semi-analytical approach for the positive semidefinite
+        Procrustesproblem, Linear Algebra and its Applications, Volume 540, 2018, Pages 112-137
     """
     A, B = setup_input_arrays(
         a,
@@ -419,6 +483,16 @@ def psdp_projgrad(
 
     n, m = A.shape
 
+    default_options = {
+        "max_iter": 10000,
+        "x_tol": 1e-5,
+        "f_tol": 1e-10
+    }
+
+    for key in default_options.keys():
+        if key not in options:
+            options[key] = default_options[key] 
+
     S = _init_procustes_projgrad(A, B)
     
     # Performing some precomputations
@@ -432,9 +506,9 @@ def psdp_projgrad(
     i = 1
     eps  = 1
     eps0 = 0
-    err = np.zeros((max_iterations + 1, 1))
+    err = np.zeros((options["max_iter"] + 1, 1))
 
-    while i <= max_iterations and eps >= delta*eps0:    
+    while i <= options["max_iter"] and eps >= options["x_tol"]*eps0:    
         S_old = S
         # Projected gradient step
         S = _psd_proj(S - (S@AAT - BAT)/max_eig)
@@ -442,7 +516,7 @@ def psdp_projgrad(
             eps0 = np.linalg.norm(S-S_old, 'fro')
         eps = np.linalg.norm(S-S_old, 'fro')
         err[i] = np.linalg.norm(S@A-B, 'fro')
-        if err[i] < tol:
+        if err[i] < options["f_tol"]:
             break
         i += 1
 
